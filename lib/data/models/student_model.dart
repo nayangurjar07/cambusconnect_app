@@ -1,4 +1,4 @@
-import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cambus_connect_app/core/firestore_parsers.dart';
 
 /// Matches the exact Firestore schema written by the web app (src/services/students.js).
 ///
@@ -36,11 +36,10 @@ class StudentModel {
   /// Web field: 'pickupStop'
   final String? pickupStop;
 
-  /// Web field: 'passValidity' (ISO date string 'YYYY-MM-DD')
+  /// Web field: 'passValidity' (ISO date string 'YYYY-MM-DD' or Timestamp)
   final DateTime passValidity;
 
   /// Web field: 'qrSecret' — 32-char hex cryptographic secret for TOTP generation.
-  /// The QR token is SHA-256(qrSecret:timeWindowIndex)[0:16], rotating every 15 min.
   final String? qrSecret;
 
   /// Web field: 'status' ('Active' | 'Inactive' | 'Revoked')
@@ -70,45 +69,39 @@ class StudentModel {
   });
 
   factory StudentModel.fromJson(Map<String, dynamic> json) {
-    // passValidity: web stores as ISO string ('2026-12-31') OR Firestore Timestamp
-    DateTime parsedValidity;
-    final rawValidity = json['passValidity'];
-    if (rawValidity is Timestamp) {
-      parsedValidity = rawValidity.toDate();
-    } else if (rawValidity is String) {
-      parsedValidity = DateTime.tryParse(rawValidity) ?? DateTime.now().add(const Duration(days: 30));
-    } else {
-      parsedValidity = DateTime.now().add(const Duration(days: 30));
-    }
+    final parsedValidity = FirestoreParsers.parseDate(json['passValidity']) ??
+        DateTime.now().add(const Duration(days: 30));
+
+    final parsedCollegeId = json['collegeId']?.toString().trim() ??
+        json['enrollment']?.toString().trim() ??
+        json['studentId']?.toString().trim() ??
+        '';
+
+    final parsedEnrollment = json['enrollment']?.toString().trim() ??
+        parsedCollegeId;
 
     return StudentModel(
-      name: json['name'] ?? '',
-      email: json['email'] ?? '',
-      // Web uses 'collegeId'
-      collegeId: json['collegeId'] ?? json['enrollment'] ?? json['studentId'] ?? '',
-      enrollment: json['enrollment'] ?? json['collegeId'] ?? json['studentId'] ?? '',
-      phone: json['phone'] ?? '',
-      parentPhone: json['parentPhone'] ?? json['emergencyPhone'] ?? '',
-      // Web uses 'busRoute' for route name
-      busRoute: json['busRoute'] ?? json['assignedRoute'] ?? '',
-      routeId: json['routeId'],
-      assignedBusId: json['assignedBusId'],
-      // Web uses 'assignedBusNumber'
-      assignedBusNumber: json['assignedBusNumber'] ?? json['busNumber'],
-      // Web uses 'pickupStop'
-      pickupStop: json['pickupStop'] ?? json['boardingStop'],
+      name: json['name']?.toString() ?? '',
+      email: json['email']?.toString() ?? '',
+      collegeId: parsedCollegeId,
+      enrollment: parsedEnrollment,
+      phone: json['phone']?.toString() ?? '',
+      parentPhone: json['parentPhone']?.toString() ?? json['emergencyPhone']?.toString() ?? '',
+      busRoute: json['busRoute']?.toString() ?? json['assignedRoute']?.toString() ?? 'Not Assigned',
+      routeId: json['routeId']?.toString(),
+      assignedBusId: json['assignedBusId']?.toString(),
+      assignedBusNumber: json['assignedBusNumber']?.toString() ?? json['busNumber']?.toString(),
+      pickupStop: json['pickupStop']?.toString() ?? json['boardingStop']?.toString(),
       passValidity: parsedValidity,
-      // Web field 'qrSecret' — the TOTP cryptographic secret
-      qrSecret: json['qrSecret'],
-      // Web uses 'status' (not 'passStatus')
-      status: json['status'] ?? json['passStatus'] ?? 'Active',
-      branch: json['branch'],
-      year: json['year'],
+      qrSecret: json['qrSecret']?.toString(),
+      status: json['status']?.toString() ?? json['passStatus']?.toString() ?? 'Active',
+      branch: json['branch']?.toString(),
+      year: json['year']?.toString(),
     );
   }
 
   bool get isActive => status.toLowerCase() == 'active';
-  bool get isExpired => passValidity.isBefore(DateTime.now());
+  bool get isExpired => !FirestoreParsers.isPassActive(passValidity);
   bool get isValid => isActive && !isExpired;
 }
 
@@ -144,7 +137,7 @@ class BusPassModel {
       email: s.email,
       displayId: s.collegeId.isNotEmpty ? s.collegeId : s.email,
       branch: s.branch,
-      assignedRoute: s.busRoute.isNotEmpty ? s.busRoute : null,
+      assignedRoute: s.busRoute.isNotEmpty && s.busRoute != 'Not Assigned' ? s.busRoute : null,
       boardingStop: s.pickupStop,
       status: s.status,
       passValidity: s.passValidity,
@@ -153,5 +146,5 @@ class BusPassModel {
   }
 
   bool get isValid =>
-      status.toLowerCase() == 'active' && !passValidity.isBefore(DateTime.now());
+      status.toLowerCase() == 'active' && FirestoreParsers.isPassActive(passValidity);
 }

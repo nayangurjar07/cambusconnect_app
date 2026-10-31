@@ -49,7 +49,12 @@ app.*.map.json
 
 logcat.txt
 
-
 android/build/
 android/.kotlin/
 
+# Secrets and local config
+.env.json
+.env.*.json
+!.env.example.json
+android/local.properties
+local.properties

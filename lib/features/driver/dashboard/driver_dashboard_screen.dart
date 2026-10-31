@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:cambus_connect_app/features/auth/auth_controller.dart';
 import 'package:cambus_connect_app/features/driver/driver_providers.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
@@ -69,12 +70,29 @@ class _DriverDashboardScreenState extends ConsumerState<DriverDashboardScreen> {
       }
     });
 
-    // Start GPS stream
-    _positionStream = Geolocator.getPositionStream(
-      locationSettings: const LocationSettings(
+    // Start GPS stream with Android Foreground Service settings
+    LocationSettings locationSettings;
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      locationSettings = AndroidSettings(
         accuracy: LocationAccuracy.high,
-        distanceFilter: 10,
-      ),
+        distanceFilter: 20,
+        intervalDuration: const Duration(seconds: 12),
+        foregroundNotificationConfig: const ForegroundNotificationConfig(
+          notificationTitle: 'CamBus Driver Live Tracking',
+          notificationText: 'Broadcasting real-time bus location to students',
+          notificationIcon: AndroidResource(name: 'ic_launcher'),
+          enableWakeLock: true,
+        ),
+      );
+    } else {
+      locationSettings = const LocationSettings(
+        accuracy: LocationAccuracy.high,
+        distanceFilter: 20,
+      );
+    }
+
+    _positionStream = Geolocator.getPositionStream(
+      locationSettings: locationSettings,
     ).listen((position) {
       if (mounted) {
         setState(() {
@@ -121,10 +139,11 @@ class _DriverDashboardScreenState extends ConsumerState<DriverDashboardScreen> {
 
   Future<void> _updateFirestoreLocation(Position position) async {
     final driverProfile = ref.read(driverProfileProvider).value;
-    if (driverProfile?.assignedBusId == null) return;
+    final busId = driverProfile?.assignedBusId?.trim();
+    if (busId == null || busId.isEmpty || busId.toLowerCase() == 'not assigned') return;
 
     final now = DateTime.now();
-    // Throttle: minimum 4 seconds between Firestore writes, unless displacement > 20m
+    // Throttle: minimum 10 seconds between Firestore writes, unless displacement > 20m
     if (_lastFirestoreLocationUpdate != null && _lastRecordedPosition != null) {
       final elapsedMs =
           now.difference(_lastFirestoreLocationUpdate!).inMilliseconds;
@@ -135,8 +154,8 @@ class _DriverDashboardScreenState extends ConsumerState<DriverDashboardScreen> {
         position.longitude,
       );
 
-      // Skip database write if under 4 seconds AND moved less than 20 meters
-      if (elapsedMs < 4000 && distanceMoved < 20.0) {
+      // Skip database write if under 10 seconds AND moved less than 20 meters
+      if (elapsedMs < 10000 && distanceMoved < 20.0) {
         return;
       }
     }
@@ -147,14 +166,19 @@ class _DriverDashboardScreenState extends ConsumerState<DriverDashboardScreen> {
     try {
       await FirebaseFirestore.instance
           .collection('buses')
-          .doc(driverProfile!.assignedBusId)
+          .doc(busId)
           .update({
         'latitude': position.latitude,
         'longitude': position.longitude,
+        'location': {
+          'lat': position.latitude,
+          'lng': position.longitude,
+        },
         'speed': position.speed * 3.6, // m/s to km/h
         'heading': position.heading,
         'accuracy': position.accuracy,
         'lastUpdated': FieldValue.serverTimestamp(),
+        'lastGpsUpdate': FieldValue.serverTimestamp(),
         'locationSource': 'driver_app',
         'status': 'On Route',
       });

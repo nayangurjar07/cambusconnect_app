@@ -1,7 +1,7 @@
+import 'package:cambus_connect_app/core/firestore_parsers.dart';
 import 'package:cambus_connect_app/data/models/bus_model.dart';
 import 'package:cambus_connect_app/features/auth/auth_controller.dart';
 import 'package:cambus_connect_app/features/student/student_providers.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 // ─── Driver Profile Model ────────────────────────────────────────────────────
@@ -42,9 +42,10 @@ final driverProfileProvider = FutureProvider<DriverProfile?>((ref) async {
   if (user == null) return null;
 
   final firestore = ref.read(firestoreProvider);
+  final cleanEmail = user.email.toLowerCase().trim();
 
   // Try by email document first (matches web portal structure)
-  final doc = await firestore.collection('users').doc(user.email).get();
+  final doc = await firestore.collection('users').doc(cleanEmail).get();
   if (doc.exists) {
     return DriverProfile.fromJson(doc.data()!);
   }
@@ -52,7 +53,7 @@ final driverProfileProvider = FutureProvider<DriverProfile?>((ref) async {
   // Fallback: query by email field
   final query = await firestore
       .collection('users')
-      .where('email', isEqualTo: user.email)
+      .where('email', isEqualTo: cleanEmail)
       .limit(1)
       .get();
 
@@ -68,16 +69,17 @@ final driverProfileProvider = FutureProvider<DriverProfile?>((ref) async {
 
 final driverAssignedBusProvider = StreamProvider.autoDispose<BusModel?>((ref) {
   final driverProfile = ref.watch(driverProfileProvider).value;
-  if (driverProfile == null || driverProfile.assignedBusId == null) {
+  final busId = driverProfile?.assignedBusId?.trim();
+  if (busId == null || busId.isEmpty || busId.toLowerCase() == 'not assigned') {
     return Stream.value(null);
   }
 
   final firestore = ref.read(firestoreProvider);
   return firestore
       .collection('buses')
-      .doc(driverProfile.assignedBusId)
+      .doc(busId)
       .snapshots()
-      .map((doc) => doc.exists ? BusModel.fromJson(doc.data()!) : null);
+      .map((doc) => doc.exists ? BusModel.fromJson({'id': doc.id, ...doc.data()!}) : null);
 });
 
 // ─── All Buses List for Driver Selection ─────────────────────────────────────
@@ -85,7 +87,7 @@ final driverAssignedBusProvider = StreamProvider.autoDispose<BusModel?>((ref) {
 final allBusesProvider = StreamProvider.autoDispose<List<BusModel>>((ref) {
   final firestore = ref.read(firestoreProvider);
   return firestore.collection('buses').snapshots().map((snapshot) =>
-      snapshot.docs.map((doc) => BusModel.fromJson(doc.data())).toList());
+      snapshot.docs.map((doc) => BusModel.fromJson({'id': doc.id, ...doc.data()})).toList());
 });
 
 // ─── Driver Shift History ────────────────────────────────────────────────────
@@ -108,8 +110,8 @@ class ShiftRecord {
   factory ShiftRecord.fromJson(Map<String, dynamic> json, String id) {
     return ShiftRecord(
       sessionId: id,
-      startTime: (json['startTime'] as Timestamp?)?.toDate() ?? DateTime.now(),
-      endTime: (json['endTime'] as Timestamp?)?.toDate(),
+      startTime: FirestoreParsers.parseDate(json['startTime']) ?? DateTime.now(),
+      endTime: FirestoreParsers.parseDate(json['endTime']),
       busNumber: json['busNumber'] ?? '',
       route: json['route'] ?? '',
     );
@@ -121,11 +123,12 @@ final driverShiftHistoryProvider =
   final user = ref.watch(authControllerProvider).value;
   if (user == null) return Stream.value([]);
 
+  final cleanEmail = user.email.toLowerCase().trim();
   final firestore = ref.read(firestoreProvider);
   // Web app writes sessions to 'driverSessions' (not 'shiftSessions')
   return firestore
       .collection('driverSessions')
-      .where('driverEmail', isEqualTo: user.email)
+      .where('driverEmail', isEqualTo: cleanEmail)
       .orderBy('startTime', descending: true)
       .limit(10)
       .snapshots()

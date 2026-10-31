@@ -1,5 +1,6 @@
 import 'package:cambus_connect_app/data/models/student_model.dart';
 import 'package:cambus_connect_app/features/student/student_providers.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 // ─── Admin Stats ─────────────────────────────────────────────────────────────
@@ -159,3 +160,42 @@ final adminSupportQueriesProvider =
           .map((doc) => SupportQuery.fromJson(doc.data(), doc.id))
           .toList());
 });
+
+/// Deletes a bus document and cascades the unassignment to all assigned students
+Future<void> cascadeDeleteBus(FirebaseFirestore firestore, String busId) async {
+  final cleanId = busId.trim();
+  if (cleanId.isEmpty) return;
+
+  final batch = firestore.batch();
+  final busRef = firestore.collection('buses').doc(cleanId);
+  batch.delete(busRef);
+
+  // Find all students assigned to this bus
+  final studentsSnap = await firestore
+      .collection('students')
+      .where('assignedBusId', isEqualTo: cleanId)
+      .get();
+
+  for (final doc in studentsSnap.docs) {
+    batch.update(doc.reference, {
+      'assignedBusId': '',
+      'assignedBusNumber': 'Not Assigned',
+      'busRoute': 'Not Assigned',
+    });
+  }
+
+  // Also update users collection if student document is duplicated there
+  final usersSnap = await firestore
+      .collection('users')
+      .where('assignedBusId', isEqualTo: cleanId)
+      .get();
+
+  for (final doc in usersSnap.docs) {
+    batch.update(doc.reference, {
+      'assignedBusId': '',
+      'busRoute': 'Not Assigned',
+    });
+  }
+
+  await batch.commit();
+}

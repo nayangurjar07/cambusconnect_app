@@ -1,10 +1,13 @@
+import 'dart:async';
 import 'dart:convert';
+import 'package:cambus_connect_app/core/firestore_parsers.dart';
 import 'package:cambus_connect_app/features/student/student_providers.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
-import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:intl/intl.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 
 class AdminScanPassScreen extends StatefulWidget {
   const AdminScanPassScreen({super.key});
@@ -13,15 +16,25 @@ class AdminScanPassScreen extends StatefulWidget {
   State<AdminScanPassScreen> createState() => _AdminScanPassScreenState();
 }
 
-class _AdminScanPassScreenState extends State<AdminScanPassScreen> {
+class _AdminScanPassScreenState extends State<AdminScanPassScreen>
+    with SingleTickerProviderStateMixin {
   final MobileScannerController _scannerController = MobileScannerController();
+  late final AnimationController _laserController;
   bool _isProcessing = false;
-  Map<String, dynamic>? _lastScanResult;
-  bool _lastScanValid = false;
-  String _lastScanMessage = '';
+  bool _torchEnabled = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _laserController = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 2),
+    )..repeat(reverse: true);
+  }
 
   @override
   void dispose() {
+    _laserController.dispose();
     _scannerController.dispose();
     super.dispose();
   }
@@ -32,10 +45,19 @@ class _AdminScanPassScreenState extends State<AdminScanPassScreen> {
 
     try {
       String lookupKey = scannedData.trim();
+      String? scannedBus;
       String? totpToken;
 
-      // 1. Parse JSON dynamic pass if present (matches web crypto.js generateTotpPayload)
-      if (scannedData.trim().startsWith('{') && scannedData.trim().endsWith('}')) {
+      // 1. Check Canonical CAMBUS:{collegeId}:{assignedBus}:{dateIso} format
+      if (scannedData.startsWith('CAMBUS:')) {
+        final parts = scannedData.split(':');
+        if (parts.length >= 4) {
+          lookupKey = parts[1].trim();
+          scannedBus = parts[2].trim();
+        }
+      }
+      // 2. Check JSON TOTP payload format
+      else if (scannedData.trim().startsWith('{') && scannedData.trim().endsWith('}')) {
         try {
           final payload = jsonDecode(scannedData) as Map<String, dynamic>;
           lookupKey = (payload['email'] ??
@@ -51,25 +73,14 @@ class _AdminScanPassScreenState extends State<AdminScanPassScreen> {
       final firestore = FirebaseFirestore.instance;
       final cleanKey = lookupKey.toLowerCase().trim();
 
-      // 2. Query Firestore by doc ID (students/{email})
+      // Query student record
       DocumentSnapshot? doc;
       final emailDoc = await firestore.collection('students').doc(cleanKey).get();
       if (emailDoc.exists) {
         doc = emailDoc;
       }
 
-      // Fallback: query by studentId / collegeId
-      if (doc == null || !doc.exists) {
-        final queryId = await firestore
-            .collection('students')
-            .where('studentId', isEqualTo: lookupKey.trim())
-            .limit(1)
-            .get();
-        if (queryId.docs.isNotEmpty) {
-          doc = queryId.docs.first;
-        }
-      }
-
+      // Query fallbacks
       if (doc == null || !doc.exists) {
         final queryCollege = await firestore
             .collection('students')
@@ -93,406 +104,378 @@ class _AdminScanPassScreenState extends State<AdminScanPassScreen> {
       }
 
       if (doc == null || !doc.exists) {
-        final queryEmailField = await firestore
+        final queryEmail = await firestore
             .collection('students')
             .where('email', isEqualTo: cleanKey)
             .limit(1)
             .get();
-        if (queryEmailField.docs.isNotEmpty) {
-          doc = queryEmailField.docs.first;
+        if (queryEmail.docs.isNotEmpty) {
+          doc = queryEmail.docs.first;
         }
       }
 
       if (doc == null || !doc.exists) {
-        setState(() {
-          _lastScanResult = null;
-          _lastScanValid = false;
-          _lastScanMessage = 'Student pass not found for "$lookupKey".';
-        });
+        HapticFeedback.vibrate();
+        _showResultSheet(
+          title: 'Pass Not Found',
+          subtitle: 'No campus registration for "$lookupKey"',
+          status: _ScanStatus.error,
+        );
         return;
       }
 
       final data = doc.data() as Map<String, dynamic>;
+      final studentName = data['name']?.toString() ?? 'Student';
+      final collegeId = (data['collegeId'] ?? data['enrollment'] ?? lookupKey).toString();
+      final routeName = data['busRoute'] ?? data['assignedRoute'] ?? 'Not Assigned';
 
-      // 3. Cryptographic Anti-Screenshot TOTP Verification
+      // 3. Cryptographic TOTP Verification (if present)
       if (totpToken != null) {
         final qrSecret = data['qrSecret'] as String?;
-        if (qrSecret == null || qrSecret.isEmpty) {
-          setState(() {
-            _lastScanResult = data;
-            _lastScanValid = false;
-            _lastScanMessage = 'Pass Rejected: QR secret not provisioned.';
-          });
-          return;
-        }
-
-        if (!verifyTotp(totpToken, qrSecret)) {
-          setState(() {
-            _lastScanResult = data;
-            _lastScanValid = false;
-            _lastScanMessage = 'Pass Rejected: Expired or Forged QR token.';
-          });
+        if (qrSecret == null || qrSecret.isEmpty || !verifyTotp(totpToken, qrSecret)) {
+          HapticFeedback.vibrate();
+          _showResultSheet(
+            title: 'Invalid or Forged Pass',
+            subtitle: 'TOTP cryptographic signature mismatch',
+            status: _ScanStatus.error,
+          );
           return;
         }
       }
 
-      // 4. Pass Validity Date Check (Handles Timestamp & ISO string)
-      DateTime? validityDate;
-      final rawValidity = data['passValidity'];
-      if (rawValidity is Timestamp) {
-        validityDate = rawValidity.toDate();
-      } else if (rawValidity is String) {
-        validityDate = DateTime.tryParse(rawValidity);
-      }
+      // 4. Pass Expiration Check
+      final isPassActive = FirestoreParsers.isPassActive(data['passValidity']);
+      final statusStr = (data['status'] ?? data['passStatus'] ?? 'Active').toString();
+      final isStatusActive = statusStr.toLowerCase() == 'active';
 
-      final isExpired = validityDate != null && validityDate.isBefore(DateTime.now());
-      if (isExpired) {
-        setState(() {
-          _lastScanResult = data;
-          _lastScanValid = false;
-          _lastScanMessage =
-              'Pass Expired on ${DateFormat('MMM d, yyyy').format(validityDate!)}';
-        });
+      if (!isPassActive || !isStatusActive) {
+        HapticFeedback.vibrate();
+        final expiryDate = FirestoreParsers.parseDate(data['passValidity']);
+        final formatted = expiryDate != null ? DateFormat('dd MMM yyyy').format(expiryDate) : 'Expired';
+        _showResultSheet(
+          title: 'Pass Inactive / Expired',
+          subtitle: '$studentName • Valid Until: $formatted',
+          status: _ScanStatus.error,
+        );
         return;
       }
 
-      // 5. Pass Status Check (Active vs Inactive/Revoked)
-      final status =
-          (data['status'] ?? data['passStatus'] ?? 'Active').toString();
-      final isActive = status.toLowerCase() == 'active';
-      if (!isActive) {
-        setState(() {
-          _lastScanResult = data;
-          _lastScanValid = false;
-          _lastScanMessage = 'Pass Status: ${status.toUpperCase()}';
-        });
+      // 5. Anti-Passback Check
+      final todayIso = FirestoreParsers.toIsoDateString(DateTime.now());
+      final boardingDocRef = firestore.collection('daily_boardings').doc('${todayIso}_$collegeId');
+      final boardingDoc = await boardingDocRef.get();
+
+      if (boardingDoc.exists) {
+        HapticFeedback.vibrate();
+        _showResultSheet(
+          title: 'Already Boarded Today',
+          subtitle: '$studentName has already scanned today (Anti-passback alert)',
+          status: _ScanStatus.warning,
+          studentName: studentName,
+          collegeId: collegeId,
+          route: routeName,
+        );
         return;
       }
 
-      // 6. Approved
-      setState(() {
-        _lastScanResult = data;
-        _lastScanValid = true;
-        _lastScanMessage =
-            'Approved: ${data['name'] ?? 'Student'} (${data['busRoute'] ?? data['assignedRoute'] ?? 'Bus Pass'})';
+      // 6. Record Boarding in Firestore
+      await boardingDocRef.set({
+        'collegeId': collegeId,
+        'studentName': studentName,
+        'busId': scannedBus ?? data['assignedBusId'] ?? '',
+        'scannedAt': FieldValue.serverTimestamp(),
+        'date': todayIso,
       });
+
+      // 7. Approved!
+      HapticFeedback.heavyImpact();
+      _showResultSheet(
+        title: 'Boarding Approved',
+        subtitle: '$studentName ($collegeId)',
+        status: _ScanStatus.success,
+        studentName: studentName,
+        collegeId: collegeId,
+        route: routeName,
+      );
     } catch (e) {
-      setState(() {
-        _lastScanResult = null;
-        _lastScanValid = false;
-        _lastScanMessage = 'Scan verification error: $e';
-      });
-    } finally {
-      setState(() => _isProcessing = false);
+      HapticFeedback.vibrate();
+      _showResultSheet(
+        title: 'Scan Error',
+        subtitle: e.toString(),
+        status: _ScanStatus.error,
+      );
     }
+  }
+
+  void _showResultSheet({
+    required String title,
+    required String subtitle,
+    required _ScanStatus status,
+    String? studentName,
+    String? collegeId,
+    String? route,
+  }) {
+    Color bg;
+    IconData icon;
+    switch (status) {
+      case _ScanStatus.success:
+        bg = const Color(0xFF059669);
+        icon = Icons.check_circle_rounded;
+        break;
+      case _ScanStatus.warning:
+        bg = const Color(0xFFD97706);
+        icon = Icons.warning_amber_rounded;
+        break;
+      case _ScanStatus.error:
+        bg = const Color(0xFFDC2626);
+        icon = Icons.cancel_rounded;
+        break;
+    }
+
+    Timer? autoDismissTimer;
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isDismissible: true,
+      builder: (ctx) {
+        autoDismissTimer = Timer(const Duration(milliseconds: 2500), () {
+          if (ctx.mounted) Navigator.of(ctx).pop();
+        });
+
+        return Container(
+          margin: const EdgeInsets.all(16),
+          padding: const EdgeInsets.all(20),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(24),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.15),
+                blurRadius: 20,
+                offset: const Offset(0, 4),
+              ),
+            ],
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 56,
+                height: 56,
+                decoration: BoxDecoration(
+                  color: bg.withValues(alpha: 0.12),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(icon, color: bg, size: 34),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                title,
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                  color: bg,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                subtitle,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontSize: 13,
+                  color: Color(0xFF475569),
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+              if (route != null) ...[
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFF1F5F9),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Text(
+                    'Route: $route',
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: Color(0xFF1E293B),
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        );
+      },
+    ).whenComplete(() {
+      autoDismissTimer?.cancel();
+      // Ready for next student
+      if (mounted) {
+        setState(() => _isProcessing = false);
+      }
+    });
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFF8FAFC),
-      appBar: AppBar(
-        title: const Text('Scan Pass',
-            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-        backgroundColor: const Color(0xFF2563EB),
-        foregroundColor: Colors.white,
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back_ios_new_rounded),
-          onPressed: () => context.pop(),
-        ),
-      ),
-      body: Column(
+      backgroundColor: Colors.black,
+      body: Stack(
         children: [
-          // Scanner
-          Expanded(
-            flex: 3,
-            child: Stack(
+          // ── Camera Feed ──
+          MobileScanner(
+            controller: _scannerController,
+            onDetect: (capture) {
+              final barcodes = capture.barcodes;
+              if (barcodes.isNotEmpty && barcodes.first.rawValue != null) {
+                _handleScan(barcodes.first.rawValue!);
+              }
+            },
+          ),
+
+          // ── Dark HUD Overlay with Viewfinder Reticle ──
+          SafeArea(
+            child: Column(
               children: [
-                MobileScanner(
-                  controller: _scannerController,
-                  onDetect: (capture) {
-                    final barcodes = capture.barcodes;
-                    if (barcodes.isNotEmpty && barcodes.first.rawValue != null) {
-                      _handleScan(barcodes.first.rawValue!);
-                    }
-                  },
+                // Top App Bar
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      IconButton(
+                        icon: const Icon(Icons.arrow_back_ios_new_rounded, color: Colors.white),
+                        onPressed: () => context.pop(),
+                      ),
+                      const Text(
+                        'Driver Scanner HUD',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 17,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 0.5,
+                        ),
+                      ),
+                      IconButton(
+                        icon: Icon(
+                          _torchEnabled ? Icons.flash_on_rounded : Icons.flash_off_rounded,
+                          color: _torchEnabled ? const Color(0xFFFBBF24) : Colors.white,
+                        ),
+                        onPressed: () {
+                          _scannerController.toggleTorch();
+                          setState(() => _torchEnabled = !_torchEnabled);
+                        },
+                      ),
+                    ],
+                  ),
                 ),
-                // Scan overlay
+
+                const Spacer(),
+
+                // Viewfinder Reticle Box with Animated Laser Sweep
                 Center(
                   child: Container(
-                    width: 250,
-                    height: 250,
+                    width: 270,
+                    height: 270,
                     decoration: BoxDecoration(
-                      border: Border.all(
-                        color: _isProcessing
-                            ? const Color(0xFFF59E0B)
-                            : const Color(0xFF00E676),
-                        width: 2.5,
-                      ),
-                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(color: Colors.white30, width: 1.5),
+                      borderRadius: BorderRadius.circular(24),
+                    ),
+                    child: Stack(
+                      children: [
+                        // Reticle Corners
+                        const _ReticleCorner(alignment: Alignment.topLeft),
+                        const _ReticleCorner(alignment: Alignment.topRight),
+                        const _ReticleCorner(alignment: Alignment.bottomLeft),
+                        const _ReticleCorner(alignment: Alignment.bottomRight),
+
+                        // Animated Laser Line
+                        AnimatedBuilder(
+                          animation: _laserController,
+                          builder: (context, child) {
+                            return Positioned(
+                              top: _laserController.value * 250,
+                              left: 10,
+                              right: 10,
+                              child: Container(
+                                height: 2.5,
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF00E5FF),
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color: const Color(0xFF00E5FF).withValues(alpha: 0.8),
+                                      blurRadius: 10,
+                                      spreadRadius: 2,
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                      ],
                     ),
                   ),
                 ),
-                // Status indicator
-                Positioned(
-                  top: 16,
-                  left: 0,
-                  right: 0,
-                  child: Center(
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 16, vertical: 8),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withValues(alpha: 0.6),
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                      child: Text(
-                        _isProcessing
-                            ? 'Verifying...'
-                            : 'Point camera at student QR code',
-                        style: const TextStyle(
-                            color: Colors.white, fontSize: 13),
-                      ),
-                    ),
+
+                const SizedBox(height: 24),
+                const Text(
+                  'Align QR code inside frame',
+                  style: TextStyle(
+                    color: Colors.white70,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+
+                const Spacer(),
+
+                // Switch Camera Button
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 24),
+                  child: IconButton(
+                    iconSize: 32,
+                    icon: const Icon(Icons.flip_camera_ios_rounded, color: Colors.white70),
+                    onPressed: () => _scannerController.switchCamera(),
                   ),
                 ),
               ],
-            ),
-          ),
-
-          // Results Panel
-          Expanded(
-            flex: 2,
-            child: Container(
-              width: double.infinity,
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius:
-                    const BorderRadius.vertical(top: Radius.circular(28)),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.08),
-                    blurRadius: 20,
-                    offset: const Offset(0, -4),
-                  ),
-                ],
-              ),
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.all(24),
-                child: _lastScanResult != null
-                    ? _buildResultCard()
-                    : _lastScanMessage.isNotEmpty
-                        ? _buildErrorCard()
-                        : _buildWaitingCard(),
-              ),
             ),
           ),
         ],
       ),
     );
   }
+}
 
-  Widget _buildResultCard() {
-    final data = _lastScanResult!;
-    DateTime? passValidity;
-    final rawValidity = data['passValidity'];
-    if (rawValidity is Timestamp) {
-      passValidity = rawValidity.toDate();
-    } else if (rawValidity is String) {
-      passValidity = DateTime.tryParse(rawValidity);
-    }
+enum _ScanStatus { success, warning, error }
 
-    return Column(
-      children: [
-        // Status
-        Container(
-          width: double.infinity,
-          padding: const EdgeInsets.all(16),
-          decoration: BoxDecoration(
-            color: _lastScanValid
-                ? const Color(0xFFF0FDF4)
-                : const Color(0xFFFEF2F2),
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(
-              color: _lastScanValid
-                  ? const Color(0xFF86EFAC)
-                  : const Color(0xFFFECACA),
-            ),
-          ),
-          child: Row(
-            children: [
-              Icon(
-                _lastScanValid
-                    ? Icons.check_circle_rounded
-                    : Icons.cancel_rounded,
-                color: _lastScanValid
-                    ? const Color(0xFF16A34A)
-                    : const Color(0xFFEF4444),
-                size: 28,
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      _lastScanMessage,
-                      style: TextStyle(
-                        fontSize: 15,
-                        fontWeight: FontWeight.w700,
-                        color: _lastScanValid
-                            ? const Color(0xFF16A34A)
-                            : const Color(0xFFEF4444),
-                      ),
-                    ),
-                    Text(
-                      DateFormat('hh:mm:ss a').format(DateTime.now()),
-                      style: const TextStyle(
-                          fontSize: 11, color: Color(0xFF94A3B8)),
-                    ),
-                  ],
-                ),
-              ),
-            ],
+class _ReticleCorner extends StatelessWidget {
+  final Alignment alignment;
+  const _ReticleCorner({required this.alignment});
+
+  @override
+  Widget build(BuildContext context) {
+    final isTop = alignment == Alignment.topLeft || alignment == Alignment.topRight;
+    final isLeft = alignment == Alignment.topLeft || alignment == Alignment.bottomLeft;
+
+    return Align(
+      alignment: alignment,
+      child: Container(
+        width: 24,
+        height: 24,
+        decoration: BoxDecoration(
+          border: Border(
+            top: isTop ? const BorderSide(color: Color(0xFF00E5FF), width: 3.5) : BorderSide.none,
+            bottom: !isTop ? const BorderSide(color: Color(0xFF00E5FF), width: 3.5) : BorderSide.none,
+            left: isLeft ? const BorderSide(color: Color(0xFF00E5FF), width: 3.5) : BorderSide.none,
+            right: !isLeft ? const BorderSide(color: Color(0xFF00E5FF), width: 3.5) : BorderSide.none,
           ),
         ),
-        const SizedBox(height: 16),
-
-        // Student Info
-        Container(
-          padding: const EdgeInsets.all(16),
-          decoration: BoxDecoration(
-            color: const Color(0xFFF9FAFB),
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: const Color(0xFFE2E8F0)),
-          ),
-          child: Column(
-            children: [
-              _infoRow('Name', data['name'] ?? 'Unknown'),
-              const Divider(height: 20),
-              _infoRow('Student ID',
-                  data['studentId'] ?? data['collegeId'] ?? data['enrollment'] ?? '—'),
-              const Divider(height: 20),
-              _infoRow('Branch', data['branch'] ?? '—'),
-              const Divider(height: 20),
-              _infoRow('Route',
-                  data['busRoute'] ?? data['assignedRoute'] ?? 'Not Assigned'),
-              if (data['assignedBusNumber'] != null || data['busNumber'] != null) ...[
-                const Divider(height: 20),
-                _infoRow('Bus Number',
-                    (data['assignedBusNumber'] ?? data['busNumber']).toString()),
-              ],
-              if (passValidity != null) ...[
-                const Divider(height: 20),
-                _infoRow('Valid Until',
-                    DateFormat('MMM d, yyyy').format(passValidity)),
-              ],
-            ],
-          ),
-        ),
-        const SizedBox(height: 16),
-
-        // Scan Again
-        SizedBox(
-          width: double.infinity,
-          height: 48,
-          child: ElevatedButton.icon(
-            onPressed: () {
-              setState(() {
-                _lastScanResult = null;
-                _lastScanMessage = '';
-              });
-            },
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF2563EB),
-              foregroundColor: Colors.white,
-              elevation: 0,
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12)),
-            ),
-            icon: const Icon(Icons.qr_code_scanner_rounded, size: 20),
-            label: const Text('Scan Another',
-                style: TextStyle(fontWeight: FontWeight.w700)),
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildErrorCard() {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(24),
-      decoration: BoxDecoration(
-        color: const Color(0xFFFEF2F2),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: const Color(0xFFFECACA)),
       ),
-      child: Column(
-        children: [
-          const Icon(Icons.error_outline_rounded,
-              size: 48, color: Color(0xFFEF4444)),
-          const SizedBox(height: 12),
-          Text(_lastScanMessage,
-              style: const TextStyle(
-                  fontSize: 15,
-                  fontWeight: FontWeight.w600,
-                  color: Color(0xFFEF4444)),
-              textAlign: TextAlign.center),
-          const SizedBox(height: 16),
-          TextButton(
-            onPressed: () => setState(() => _lastScanMessage = ''),
-            child: const Text('Try Again'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildWaitingCard() {
-    return Column(
-      children: [
-        Container(
-          padding: const EdgeInsets.all(20),
-          decoration: BoxDecoration(
-            color: const Color(0xFFEFF6FF),
-            shape: BoxShape.circle,
-            border: Border.all(color: const Color(0xFFBFDBFE)),
-          ),
-          child: const Icon(Icons.qr_code_scanner_rounded,
-              size: 48, color: Color(0xFF2563EB)),
-        ),
-        const SizedBox(height: 20),
-        const Text('Ready to Scan',
-            style: TextStyle(
-                fontSize: 20,
-                fontWeight: FontWeight.bold,
-                color: Color(0xFF1E293B))),
-        const SizedBox(height: 8),
-        Text(
-          'Point your camera at a student\'s digital pass QR code to verify.',
-          style: TextStyle(fontSize: 13, color: Colors.grey[500]),
-          textAlign: TextAlign.center,
-        ),
-      ],
-    );
-  }
-
-  Widget _infoRow(String label, String value) {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: [
-        Text(label,
-            style: const TextStyle(
-                fontSize: 13,
-                color: Color(0xFF64748B),
-                fontWeight: FontWeight.w500)),
-        Text(value,
-            style: const TextStyle(
-                fontSize: 13,
-                color: Color(0xFF1E293B),
-                fontWeight: FontWeight.w600)),
-      ],
     );
   }
 }

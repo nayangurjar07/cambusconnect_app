@@ -1,4 +1,4 @@
-import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cambus_connect_app/core/firestore_parsers.dart';
 
 class NotificationModel {
   final String notificationId;
@@ -26,14 +26,14 @@ class NotificationModel {
   factory NotificationModel.fromJson(Map<String, dynamic> json, String id) {
     return NotificationModel(
       notificationId: id,
-      title: json['title'] ?? '',
-      message: json['message'] ?? '',
-      type: json['type'] ?? 'general',
-      targetAudience: json['targetAudience'] ?? 'all',
-      targetRouteId: json['targetRouteId'],
-      targetBusId: json['targetBusId'],
-      senderEmail: json['senderEmail'] ?? '',
-      createdAt: (json['createdAt'] as Timestamp?)?.toDate() ?? DateTime.now(),
+      title: json['title']?.toString() ?? '',
+      message: json['message']?.toString() ?? '',
+      type: json['type']?.toString() ?? 'general',
+      targetAudience: json['targetAudience']?.toString() ?? 'all',
+      targetRouteId: json['targetRouteId']?.toString(),
+      targetBusId: json['targetBusId']?.toString(),
+      senderEmail: json['senderEmail']?.toString() ?? '',
+      createdAt: FirestoreParsers.parseDate(json['createdAt']) ?? DateTime.now(),
     );
   }
 }

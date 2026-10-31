@@ -1,3 +1,4 @@
+import 'package:cambus_connect_app/core/firestore_parsers.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 
 /// Matches the exact Firestore schema written by the web app (src/services/transit.js).
@@ -26,7 +27,7 @@ class BusModel {
   /// Web field: 'location.lng'
   final double longitude;
   final double speed;
-  /// Web field: 'lastGpsUpdate' (Firestore Timestamp)
+  /// Web field: 'lastGpsUpdate' (Firestore Timestamp or ISO Date string)
   final DateTime? lastGpsUpdate;
   /// Web field: 'lastUpdate' (HH:MM string)
   final String lastUpdate;
@@ -50,31 +51,49 @@ class BusModel {
   });
 
   factory BusModel.fromJson(Map<String, dynamic> json) {
-    // Web stores location as nested map: { lat: ..., lng: ... }
-    final locationMap = json['location'] as Map<String, dynamic>?;
-    final lat = (locationMap?['lat'] as num?)?.toDouble() ?? 0.0;
-    final lng = (locationMap?['lng'] as num?)?.toDouble() ?? 0.0;
+    double lat = 0.0;
+    double lng = 0.0;
+
+    // Check nested location map or currentLocation GeoPoint/Map
+    if (json['location'] is Map) {
+      final loc = json['location'] as Map;
+      lat = FirestoreParsers.parseCoord(loc['lat'] ?? loc['latitude']);
+      lng = FirestoreParsers.parseCoord(loc['lng'] ?? loc['longitude']);
+    } else if (json['currentLocation'] is GeoPoint) {
+      final gp = json['currentLocation'] as GeoPoint;
+      lat = gp.latitude;
+      lng = gp.longitude;
+    } else if (json['currentLocation'] is Map) {
+      final loc = json['currentLocation'] as Map;
+      lat = FirestoreParsers.parseCoord(loc['latitude'] ?? loc['lat']);
+      lng = FirestoreParsers.parseCoord(loc['longitude'] ?? loc['lng']);
+    } else {
+      lat = FirestoreParsers.parseCoord(json['latitude'] ?? json['lat']);
+      lng = FirestoreParsers.parseCoord(json['longitude'] ?? json['lng']);
+    }
+
+    final parsedSpeed = (json['speed'] as num?)?.toDouble() ??
+        FirestoreParsers.parseCoord(json['speed'], 0.0);
 
     return BusModel(
-      busId: json['id'] ?? json['busId'] ?? '',
+      busId: json['id']?.toString() ?? json['busId']?.toString() ?? '',
       // Web field is 'number', not 'busNumber'
-      busNumber: json['number'] ?? json['busNumber'] ?? '',
+      busNumber: json['number']?.toString() ?? json['busNumber']?.toString() ?? '',
       // Web field is 'registrationNumber', not 'plateNumber'
       registrationNumber:
-          json['registrationNumber'] ?? json['plateNumber'] ?? '',
+          json['registrationNumber']?.toString() ?? json['plateNumber']?.toString() ?? '',
       capacity: (json['capacity'] as num?)?.toInt() ?? 45,
       headcount: (json['headcount'] as num?)?.toInt() ?? 0,
-      routeId: json['routeId'] ?? '',
+      routeId: json['routeId']?.toString() ?? '',
       // Web field is 'route', not 'routeName'
-      routeName: json['route'] ?? json['routeName'] ?? '',
-      status: json['status'] ?? 'On Time',
-      driverName: json['driver'] ?? json['driverName'],
-      driverPhone: json['phone'] ?? json['driverPhone'],
+      routeName: json['route']?.toString() ?? json['routeName']?.toString() ?? 'Unassigned Route',
+      status: json['status']?.toString() ?? 'On Time',
+      driverName: json['driver']?.toString() ?? json['driverName']?.toString(),
+      driverPhone: json['phone']?.toString() ?? json['driverPhone']?.toString(),
       latitude: lat,
       longitude: lng,
-      speed: (json['speed'] as num?)?.toDouble() ?? 0.0,
-      lastGpsUpdate: (json['lastGpsUpdate'] as Timestamp?)?.toDate()
-          ?? (json['updatedAt'] as Timestamp?)?.toDate(),
+      speed: parsedSpeed,
+      lastGpsUpdate: FirestoreParsers.parseDate(json['lastGpsUpdate'] ?? json['updatedAt']),
       lastUpdate: json['lastUpdate']?.toString() ?? '',
     );
   }

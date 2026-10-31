@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:cambus_connect_app/core/firestore_parsers.dart';
 import 'package:cambus_connect_app/data/models/bus_model.dart';
 import 'package:cambus_connect_app/data/models/notification_model.dart';
 import 'package:cambus_connect_app/data/models/student_model.dart';
@@ -27,18 +28,19 @@ class StudentProfileNotifier extends AsyncNotifier<StudentModel?> {
     if (user == null) return null;
 
     final firestore = ref.read(firestoreProvider);
+    final cleanEmail = user.email.toLowerCase().trim();
 
-    // 1. Primary: lookup by email (doc ID) in /students — matches web structure
+    // 1. Primary: lookup by lowercase email (doc ID) in /students
     final emailDoc =
-        await firestore.collection('students').doc(user.email).get();
+        await firestore.collection('students').doc(cleanEmail).get();
     if (emailDoc.exists) {
       return StudentModel.fromJson(emailDoc.data()!);
     }
 
-    // 2. Fallback: query by 'email' field (for docs not keyed by email)
+    // 2. Fallback: query by 'email' field
     final emailQuery = await firestore
         .collection('students')
-        .where('email', isEqualTo: user.email)
+        .where('email', isEqualTo: cleanEmail)
         .limit(1)
         .get();
     if (emailQuery.docs.isNotEmpty) {
@@ -48,7 +50,7 @@ class StudentProfileNotifier extends AsyncNotifier<StudentModel?> {
     // 3. Fallback: query by 'collegeId' field
     final idQuery = await firestore
         .collection('students')
-        .where('collegeId', isEqualTo: user.email)
+        .where('collegeId', isEqualTo: cleanEmail)
         .limit(1)
         .get();
     if (idQuery.docs.isNotEmpty) {
@@ -60,16 +62,25 @@ class StudentProfileNotifier extends AsyncNotifier<StudentModel?> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. Bus Pass Provider — TOTP-based, matching web crypto.js exactly
-//
-// Web TOTP algorithm (src/utils/crypto.js):
-//   timeIndex = floor(Date.now() / 900_000)    [15-min window]
-//   token = SHA-256("${qrSecret}:${timeIndex}")[0:16]  [first 16 hex chars]
-//   QR payload = JSON: { email, totp: token, t: timeIndex }
-//
-// This Dart implementation mirrors that exactly so the admin scan pass
-// on the web can verify tokens generated here.
+// 2. Bus Pass Provider — Canonical format & TOTP backward compatibility
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Generates the canonical deterministic QR payload:
+/// Format: CAMBUS:{collegeId}:{assignedBusId}:{todayIso}
+String generateCanonicalQrPayload({
+  required String collegeId,
+  required String? assignedBusId,
+  DateTime? date,
+}) {
+  final cleanId = collegeId.trim().isNotEmpty ? collegeId.trim() : 'UNKNOWN';
+  final bus = (assignedBusId != null &&
+          assignedBusId.trim().isNotEmpty &&
+          assignedBusId.trim().toLowerCase() != 'not assigned')
+      ? assignedBusId.trim()
+      : 'NA';
+  final todayIso = FirestoreParsers.toIsoDateString(date ?? DateTime.now());
+  return 'CAMBUS:$cleanId:$bus:$todayIso';
+}
 
 /// Generates the current TOTP token from [qrSecret].
 /// Matches web crypto.js generateTotpPayload() exactly.
@@ -78,11 +89,10 @@ String _generateTotpToken(String qrSecret, {int windowOffset = 0}) {
       DateTime.now().millisecondsSinceEpoch ~/ (15 * 60 * 1000) + windowOffset;
   final input = utf8.encode('$qrSecret:$timeIndex');
   final digest = sha256.convert(input).toString();
-  return digest.substring(0, 16); // First 16 hex chars = 64 bits
+  return digest.substring(0, 16); // First 16 hex chars
 }
 
 /// Builds the full QR JSON payload for [email] using [qrSecret].
-/// Matches web crypto.js generateTotpPayload() with optional studentId for legacy scanners.
 String generateQrPayload(String email, String qrSecret, {String? studentId}) {
   final timeIndex =
       DateTime.now().millisecondsSinceEpoch ~/ (15 * 60 * 1000);
@@ -96,7 +106,6 @@ String generateQrPayload(String email, String qrSecret, {String? studentId}) {
 }
 
 /// Verifies a scanned TOTP token against a student's [qrSecret].
-/// Allows current + previous window (grace period for clock skew).
 bool verifyTotp(String scannedTotp, String qrSecret) {
   if (scannedTotp.isEmpty || qrSecret.isEmpty) return false;
   final current = _generateTotpToken(qrSecret, windowOffset: 0);
@@ -104,8 +113,6 @@ bool verifyTotp(String scannedTotp, String qrSecret) {
   return scannedTotp == current || scannedTotp == previous;
 }
 
-/// Provides a [BusPassModel] derived from the student's Firestore profile.
-/// The QR payload is TOTP-generated on-device — no Cloud Function required.
 final studentPassProvider = Provider<AsyncValue<BusPassModel?>>((ref) {
   final studentProfile = ref.watch(studentProfileProvider);
   return studentProfile.whenData((student) {
@@ -116,8 +123,6 @@ final studentPassProvider = Provider<AsyncValue<BusPassModel?>>((ref) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 3. Live Bus Tracking Provider
-// Streams a single bus by Firestore document ID from /buses/{busId}.
-// The student's assignedBusId comes from their /students profile.
 // ─────────────────────────────────────────────────────────────────────────────
 final studentAssignedBusIdProvider = Provider<String?>((ref) {
   final profile = ref.watch(studentProfileProvider).value;
@@ -126,11 +131,13 @@ final studentAssignedBusIdProvider = Provider<String?>((ref) {
 
 final liveBusTrackingProvider =
     StreamProvider.family.autoDispose<BusModel?, String>((ref, busId) {
-  if (busId.isEmpty) return Stream.value(null);
+  final cleanId = busId.trim();
+  if (cleanId.isEmpty || cleanId.toLowerCase() == 'not assigned') {
+    return Stream.value(null);
+  }
   final firestore = ref.read(firestoreProvider);
-  return firestore.collection('buses').doc(busId).snapshots().map((doc) {
+  return firestore.collection('buses').doc(cleanId).snapshots().map((doc) {
     if (!doc.exists) return null;
-    // Pass doc.id as 'id' so BusModel.fromJson can use it
     final data = {'id': doc.id, ...doc.data()!};
     return BusModel.fromJson(data);
   });
@@ -147,8 +154,6 @@ final allBusesStreamProvider =
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 4. Student Notifications Provider
-// Matches web communications.js subscribeToNotifications() exactly:
-//   collection: 'notifications', ordered by createdAt desc, limit 20.
 // ─────────────────────────────────────────────────────────────────────────────
 final studentNotificationsProvider =
     StreamProvider.autoDispose<List<NotificationModel>>((ref) {
@@ -165,7 +170,6 @@ final studentNotificationsProvider =
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 5. Lost & Found Items Provider
-// Collection: 'lost-items' (exact web name from communications.js)
 // ─────────────────────────────────────────────────────────────────────────────
 class LostItem {
   final String id;
@@ -206,8 +210,7 @@ class LostItem {
       contactName: json['contactName'] ?? json['userName'] ?? json['reportedBy'] ?? '',
       contactEmail: json['contactEmail'] ?? json['userEmail'] ?? '',
       contactPhone: json['contactPhone'] ?? json['userPhone'] ?? '',
-      createdAt:
-          (json['createdAt'] as Timestamp?)?.toDate() ?? DateTime.now(),
+      createdAt: FirestoreParsers.parseDate(json['createdAt']) ?? DateTime.now(),
     );
   }
 }
@@ -215,7 +218,7 @@ class LostItem {
 final lostItemsProvider = StreamProvider.autoDispose<List<LostItem>>((ref) {
   final firestore = ref.read(firestoreProvider);
   return firestore
-      .collection('lost-items') // exact web collection name
+      .collection('lost-items')
       .orderBy('createdAt', descending: true)
       .snapshots()
       .map((snap) => snap.docs

@@ -3,6 +3,11 @@ import 'package:flutter/foundation.dart'
     show defaultTargetPlatform, kIsWeb, TargetPlatform;
 
 class DefaultFirebaseOptions {
+  static const String _firebaseApiKey = String.fromEnvironment(
+    'FIREBASE_API_KEY',
+    defaultValue: 'AIzaSyB2IxQNKHGAZ1blFbA1W_TD7-3nFl_g2w4',
+  );
+
   static FirebaseOptions get currentPlatform {
     if (kIsWeb) {
       return web;
@@ -35,7 +40,7 @@ class DefaultFirebaseOptions {
   }
 
   static const FirebaseOptions web = FirebaseOptions(
-    apiKey: 'AIzaSyB2IxQNKHGAZ1blFbA1W_TD7-3nFl_g2w4',
+    apiKey: _firebaseApiKey,
     appId: '1:289800550418:web:9100cd54ecd14a19d2c0cb',
     messagingSenderId: '289800550418',
     projectId: 'cambus-connect-iist',
@@ -46,7 +51,7 @@ class DefaultFirebaseOptions {
   );
 
   static const FirebaseOptions android = FirebaseOptions(
-    apiKey: 'AIzaSyB2IxQNKHGAZ1blFbA1W_TD7-3nFl_g2w4',
+    apiKey: _firebaseApiKey,
     appId: '1:289800550418:web:9100cd54ecd14a19d2c0cb', // Fallback to Web App ID since Android App isn't registered
     messagingSenderId: '289800550418',
     projectId: 'cambus-connect-iist',
@@ -55,7 +60,7 @@ class DefaultFirebaseOptions {
   );
 
   static const FirebaseOptions ios = FirebaseOptions(
-    apiKey: 'AIzaSyB2IxQNKHGAZ1blFbA1W_TD7-3nFl_g2w4',
+    apiKey: _firebaseApiKey,
     appId: '1:289800550418:web:9100cd54ecd14a19d2c0cb', // Fallback
     messagingSenderId: '289800550418',
     projectId: 'cambus-connect-iist',

@@ -28,10 +28,20 @@ class AuthController extends AsyncNotifier<UserModel?> {
     return ref.read(authRepositoryProvider).currentUser;
   }
 
-  Future<void> login(String email, String password) async {
+  Future<void> login(String identifier, String password) async {
     state = const AsyncLoading();
     try {
-      final user = await ref.read(authRepositoryProvider).login(email, password);
+      final user = await ref.read(authRepositoryProvider).login(identifier, password);
+      state = AsyncData(user);
+    } catch (e, st) {
+      state = AsyncError(e, st);
+    }
+  }
+
+  Future<void> signInWithGoogle() async {
+    state = const AsyncLoading();
+    try {
+      final user = await ref.read(authRepositoryProvider).signInWithGoogle();
       state = AsyncData(user);
     } catch (e, st) {
       state = AsyncError(e, st);
